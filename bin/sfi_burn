@@ -1,0 +1,153 @@
+#!/usr/bin/env ruby
+$: << File.expand_path('../../lib', __FILE__)
+require 'stormfly/image'
+require 'stormfly/image/commandline'
+
+include StormFly::Image::Util::Spinner
+include StormFly::Image::CommandLine
+
+def get_uuids(uuidfile)
+  {}.tap do |uuids|
+    spinner "Reading and generating UUIDs", short: "UUIDs" do |output|
+      File.open uuidfile, 'rb' do |f|
+        StormFly::Image::UUID::Gatherer.new(f).each do |u|
+          # build a new substitute for each UUID
+          uuids[u] = u.class.generate
+          output << "Will replace #{u} with #{uuids[u]}"
+        end
+      end # open
+    end # spinner
+  end # tap
+end
+
+def verify(file, range, data)
+  advices = [:noreuse, :dontneed]
+  advices.each do |advice|
+    # discard this specific data range
+    file.advise(advice, range.begin, range.size)
+  end
+  file.seek(range.begin)
+  (file.read(range.size) == data).tap do
+    # discard everything on the page cache
+    advices.each { |advice| file.advise advice }
+  end
+end
+
+# returns false upon a verification fail
+def burn(imagedescriptor, uuidfile, target, check, segmentsize = 1536*1024)
+  uuids = uuidfile ? get_uuids(uuidfile) : []
+  File.open imagedescriptor, 'rb' do |src|
+    r = StormFly::Image::Block::Map::Reader src, segmentsize
+    puts "=> Reading and burning <="
+    File.open target, 'rb' do |tgtdirect|
+      tgtdirect.advise :random
+      tgtdirect.advise :noreuse
+      tgtdirect.advise :dontneed
+
+      File.open target, 'wb' do |tgt|
+        tgt.advise :noreuse
+
+        r.each do |range, data|
+          return false unless spinner "Burning offsets #{range.begin}...#{range.end}", fps: (15 + Random.rand(10)) do |output|
+            p = StormFly::Image::UUID::Patcher.new(range.begin, data)
+            p.output = output
+
+            patched = uuids.map do |u, new_u|
+              matches_s, matches_b = p.replace_uuid(u, new_u)
+              (matches_s + matches_b > 0).tap do |matched|
+                output << "#{matches_s + matches_b} matches of #{u} of which #{matches_s} literal and #{matches_b} binary replaced with #{new_u}." if matched
+              end
+            end.any?
+
+            tgt.seek(range.begin)
+            tgt.write data
+
+            # :noreuse is usually a no-op (which it _is_ for Linux 3.5). make sure this gets explicited nonetheless.
+            tgt.advise(:dontneed, range.begin, range.size)
+
+            # verify if an UUID was patched or if it is the first range
+            if check and patched or range.begin == 0
+              # sync the data at this point, else we might read garbage because of page cache being discarded
+              # and the verify method reading directly without the data being necessarily on-disk
+              tgt.fdatasync rescue nil
+
+              verify(tgtdirect, range, data).tap do |ok|
+                output << (ok ? 'Verify OK' : 'Verify FAILED')
+              end
+            else
+              true	# successfully written
+            end
+
+          end # spinner
+        end # each
+      end # open
+    end # open
+  end # open
+  true
+end
+
+def with_options(*args)
+  # default options
+  options = { check: false, pagecache_hinting: true, uuidfile: nil }
+
+  optparser = option_parser(*args) do |opts|
+    opts.on '-c', '--[no-]check', 'Check critical blocks for correctness' do |bool|
+      options[:check] = bool
+    end
+
+    opts.on '-k', '--no-hints', 'Disable page cache hinting' do
+      options[:pagecache_hinting] = false
+    end
+
+    opts.on '-i IMAGEFILE', '--image', Pathname, 'Image file' do |imagefile|
+      options[:imagefile] = imagefile
+    end
+
+    opts.on '-u UUIDFILE', '--uuids', Pathname, 'UUID file' do |uuidfile|
+      options[:uuidfile] = uuidfile
+    end
+
+    opts.on '-t TARGETDEVICE', '--target', WritablePathname, 'Target device' do |targetfile|
+      options[:targetfile] = targetfile
+    end
+  end
+
+  begin
+    optparser.parse!
+  rescue OptionParser::InvalidOption, OptionParser::MissingArgument => e
+    STDERR.puts "#{e}\n#{optparser}"
+    exit 1
+  rescue ArgumentError => e
+    STDERR.puts "error: #{e}"
+    exit 2
+  end
+
+  if options[:check] and not options[:pagecache_hinting]
+    STDERR.puts "Conflicting options: it is useless to perform checks without hinting the page cache.\n#{optparser}"
+    exit 1
+  end
+
+  mandatory_opts = {:imagefile => '--image', :targetfile => '--target' }
+  missing_opts = mandatory_opts.select { |key, _| options[key].nil? }
+  unless missing_opts.empty?
+    STDERR.puts "Missing options: #{missing_opts.values.join ', '}\n#{optparser}"
+    exit 1
+  end
+
+  yield options
+end
+
+Application.run do
+  with_options "Usage: #{File.basename $0} [-h | -v] | [-c] <-i imagefile> <-u uuidfile> <-t targetdevice>" do |opt|
+    if not opt[:pagecache_hinting]
+      class File
+        def advise(*args)
+          # monkey-patching says 'Hello' ;)
+        end
+      end
+    end
+
+    # exit code 10 if burn fails verification (if enabled)
+    exit 10 unless burn opt[:imagefile], opt[:uuidfile], opt[:targetfile], opt.fetch(:check, false)
+  end
+end

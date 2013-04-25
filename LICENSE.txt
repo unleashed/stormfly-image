@@ -1,0 +1,11 @@
+Copyright (c) 2013 Now Computing, Inc. - All rights reserved.
+
+This piece of software is copyrighted under a proprietary license by
+Now Computing which forbids any kind of modification and distribution,
+which grants a non-exclusive limited usage license for registered and
+allowed licensees only.
+
+Please do contact info@nowcomputing.com for licensing and warranty terms.
+
+Any kind of modification and/or distribution requires prior written permission
+by Now Computing.

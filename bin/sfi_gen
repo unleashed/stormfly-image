@@ -1,0 +1,95 @@
+#!/usr/bin/env ruby
+$: << File.expand_path('../../lib', __FILE__)
+require 'stormfly/image'
+require 'stormfly/image/commandline'
+
+include StormFly::Image::Util::Spinner
+include StormFly::Image::CommandLine
+
+def parse(blktracefile)
+  # returns the list of blocks
+  list = spinner "Parsing" do |o|
+    StormFly::Image::Block::Parser(blktracefile).parse.tap do |l|
+      o << "Parsed #{l.size} block ranges."
+    end
+  end
+
+  spinner "Coalescing" do |o|
+    list.coalesce!.tap do |l|
+      o << "Coalesced down to #{l.size} block ranges"
+    end
+  end
+end
+
+def generate(list, source, target, &blk)
+  File.open source, 'rb' do |src|
+    g = StormFly::Image::Block::Map::Generator src, list
+
+    File.open target, 'wb' do |tgt|
+      spinner "#{source} => #{File.basename target} " do
+        StormFly::Image::Block::Map::Writer(tgt, g) do |w|
+          w.file.advise :sequential
+          w.file.advise :noreuse
+        end.write! &blk
+      end
+    end
+
+  end
+end
+
+def parse_n_generate(blktracefile, source, target)
+  generate(parse(blktracefile), source, target)
+end
+
+def with_options(*args)
+  options = { pagecache_hinting: true }
+  optparser = option_parser(*args) do |opts|
+    opts.on '-k', '--no-hints', 'Disable page cache hinting' do
+      options[:pagecache_hinting] = false
+    end
+
+    opts.on '-b BLKTRACELOG', '--blktrace', 'Base name of logs produced by blktrace' do |blktracefile|
+      options[:blktracefile] = blktracefile
+    end
+
+    opts.on '-o IMAGEFILE', '--output', WritablePathname, 'Output image file' do |imagefile|
+      options[:imagefile] = imagefile
+    end
+
+    opts.on '-s SOURCEDEVICE', '--source', Pathname, 'Source block device' do |source|
+      options[:source] = source
+    end
+  end
+
+  begin
+    optparser.parse!
+  rescue OptionParser::InvalidOption, OptionParser::MissingArgument => e
+    STDERR.puts "#{e}\n#{optparser}"
+    exit 1
+  rescue ArgumentError => e
+    STDERR.puts "error: #{e}"
+    exit 2
+  end
+
+  mandatory_opts = {:imagefile => '--output', :blktracefile => '--blktrace', :source => '--source' }
+  missing_opts = mandatory_opts.select { |key, _| options[key].nil? }
+  unless missing_opts.empty?
+    puts "Missing options: #{missing_opts.values.join ', '}\n#{optparser}"
+    exit 1
+  end
+
+  yield options
+end
+
+Application.run do
+  with_options "Usage: #{File.basename $0} [-h | -v] <-b blktracefile> <-s sourcedevice> <-i imagefile>" do |opt|
+    if not opt[:pagecache_hinting]
+      class File
+        def advise(*args)
+          # monkey-patching says 'Hello' ;)
+        end
+      end
+    end
+    parse_n_generate(opt[:blktracefile], opt[:source], opt[:imagefile])
+  end
+end
