@@ -54,37 +54,70 @@ def burn_range(file, range, data, verifyfile, output = STDOUT)
   end
 end
 
-# returns false upon a verification fail
-def burn(imagedescriptor, uuidfile, target, check, segmentsize = 1536*1024)
-  uuids = uuidfile ? get_uuids(uuidfile) : []
-  File.open imagedescriptor, 'rb' do |src|
-    r = StormFly::Image::Block::Map::Reader src, segmentsize
-    puts "=> Reading and burning <="
+def Thread.push_range(range, data, verifyfile)
+  queue.push({range: range, data: data, verifyfile: verifyfile})
+end
+
+def get_queued_range
+  r = Thread.current[:data]
+  [r[:range], r[:data], r[:verify]]
+end
+
+def burn_thread(target, output = STDOUT)
+  File.open target, 'wb' do |tgt|
+    tgt.advise :noreuse
+
     File.open target, 'rb' do |tgtdirect|
       tgtdirect.advise :random
       tgtdirect.advise :noreuse
       tgtdirect.advise :dontneed
 
-      File.open target, 'wb' do |tgt|
-        tgt.advise :noreuse
+      loop do
+        range, data, verify = queue.pop
+        break false unless burn_range(tgt, range, data, verify ? tgtdirect : nil, output)
+      end
+    end
+  end
+end
 
-        r.each do |range, data|
-          return false unless spinner "Burning offsets #{range.begin}...#{range.end}", fps: (15 + Random.rand(10)) do |output|
-            p = StormFly::Image::UUID::Patcher.new(range.begin, data)
-            p.output = output
+# returns false upon a verification fail
+def burn(imagedescriptor, uuidfile, targets, check, segmentsize = 1536*1024)
+  uuids = uuidfile ? get_uuids(uuidfile) : []
+  File.open imagedescriptor, 'rb' do |src|
+    r = StormFly::Image::Block::Map::Reader src, segmentsize
+    puts "=> Reading and burning <="
 
-            patched = uuids.map do |u, new_u|
-              matches_s, matches_b = p.replace_uuid(u, new_u)
-              (matches_s + matches_b > 0).tap do |matched|
-                output << "#{matches_s + matches_b} matches of #{u} of which #{matches_s} literal and #{matches_b} binary replaced with #{new_u}." if matched
-              end
-            end.any?
+    threads = targets.map do |tgtfile|
+      Thread.new do
+        Thread.stop
+        burn_thread(tgtfile)
+      end
+    end
 
-            burn_range(tgt, range, data, (check and patched or range.begin == 0) ? tgtdirect : nil, output)
-          end # spinner
-        end # each
-      end # open
-    end # open
+    r.each do |range, data|
+      return false unless spinner "Burning offsets #{range.begin}...#{range.end}", fps: (15 + Random.rand(10)) do |output|
+        p = StormFly::Image::UUID::Patcher.new(range.begin, data)
+        p.output = output
+
+        patched = uuids.map do |u, new_u|
+          matches_s, matches_b = p.replace_uuid(u, new_u)
+          (matches_s + matches_b > 0).tap do |matched|
+            output << "#{matches_s + matches_b} matches of #{u} of which #{matches_s} literal and #{matches_b} binary replaced with #{new_u}." if matched
+          end
+        end.any?
+
+        verify = check and patched or range.begin == 0
+        range_desc = {range: range, data: data, verify: verify)
+
+        threads.each do |t|
+          next unless t.alive?
+          t[:data] = range_desc
+          t.wakeup
+        end
+        # XXX here: wait for all threads to write everything before reading again with r.each
+      end # spinner
+    end # each
+    results = threads.map(&:value)
   end # open
   true
 end
