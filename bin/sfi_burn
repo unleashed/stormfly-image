@@ -33,6 +33,27 @@ def verify(file, range, data)
   end
 end
 
+def burn_range(file, range, data, verifyfile, output = STDOUT)
+  file.seek(range.begin)
+  file.write data
+
+  # :noreuse is usually a no-op (which it _is_ for Linux 3.5). make sure this gets explicited nonetheless.
+  file.advise(:dontneed, range.begin, range.size)
+
+  # verify if an UUID was patched or if it is the first range
+  if verifyfile
+    # sync the data at this point, else we might read garbage because of page cache being discarded
+    # and the verify method reading directly without the data being necessarily on-disk
+    file.fdatasync rescue nil
+
+    verify(verifyfile, range, data).tap do |ok|
+      output.print (ok ? 'Verify OK' : 'Verify FAILED')
+    end
+  else
+    true
+  end
+end
+
 # returns false upon a verification fail
 def burn(imagedescriptor, uuidfile, target, check, segmentsize = 1536*1024)
   uuids = uuidfile ? get_uuids(uuidfile) : []
@@ -59,25 +80,7 @@ def burn(imagedescriptor, uuidfile, target, check, segmentsize = 1536*1024)
               end
             end.any?
 
-            tgt.seek(range.begin)
-            tgt.write data
-
-            # :noreuse is usually a no-op (which it _is_ for Linux 3.5). make sure this gets explicited nonetheless.
-            tgt.advise(:dontneed, range.begin, range.size)
-
-            # verify if an UUID was patched or if it is the first range
-            if check and patched or range.begin == 0
-              # sync the data at this point, else we might read garbage because of page cache being discarded
-              # and the verify method reading directly without the data being necessarily on-disk
-              tgt.fdatasync rescue nil
-
-              verify(tgtdirect, range, data).tap do |ok|
-                output << (ok ? 'Verify OK' : 'Verify FAILED')
-              end
-            else
-              true	# successfully written
-            end
-
+            burn_range(tgt, range, data, (check and patched or range.begin == 0) ? tgtdirect : nil, output)
           end # spinner
         end # each
       end # open
