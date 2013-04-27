@@ -1,23 +1,23 @@
 module StormFly
   module Image
     class BurnManager
+
       class Burner
         attr_reader :range_queue
         attr_accessor :output
 
-        def initialize(filename, *args, &blk)
-          @filename = filename
+        def initialize(filename, output = STDOUT)
+          @filename, @output = filename, output
+
           @file = File.open filename, 'wb'
           @file.advise :noreuse
 
           @range_queue = Queue.new
-          @output = STDOUT
-
-          super(*args, &blk)
         end
 
         def burn!
           loop do
+            # block on Queue#pop
             range, data, vrfy = @range_queue.pop
             break true unless range
             break false unless burn(range, data, vrfy)
@@ -30,19 +30,15 @@ module StormFly
           @file.seek(range.begin)
           @file.write data
 
-          # :noreuse is usually a no-op (which it _is_ for Linux 3.5). make sure this gets explicited nonetheless.
+          # :noreuse is usually a no-op (which it _is_ for Linux 3.5). so make sure we also specify dontneed for each range.
           @file.advise(:dontneed, range.begin, range.size)
 
-          # verify if an UUID was patched or if it is the first range
           if verify
             # sync the data at this point, else we might read garbage because of page cache being discarded
             # and the verify method reading directly without the data being necessarily on-disk
             @file.fdatasync rescue nil
 
             verify(range, data)
-            #.tap do |ok|
-            #  @output.print (ok ? 'Verify OK' : 'Verify FAILED')
-            #end
           else
             true
           end
@@ -70,11 +66,15 @@ module StormFly
         end
       end # class Burner
 
+      attr_accessor :targets, :uuids, :check, :output
+
       def initialize(imagefile, targets, check, options = {})
+        @targets = options.fetch(:targets) { [] }
         @uuids = options.fetch(:uuids) { [] }
+        @check = options.fetch(:check, false)
         @output = options.fetch :output, STDOUT
-        segmentsize = options.fetch :segmentsize, 1536*1024
-        @r = StormFly::Image::Block::Map::Reader imagefile, segmentsize
+        @segmentsize = options.fetch :segmentsize, 1536*1024
+        @r = StormFly::Image::Block::Map::Reader @imagefile, @segmentsize
       end
 
       def burn!
@@ -105,52 +105,29 @@ module StormFly
             end
           end.any?
 
+          # this waits until all threads are waiting (waiting on Queue#pop or dead)
+          sleep 1 until threads.all? &:stop?
+          # get out if no thread is alive
+          break if threads.none? &:alive?
+
+          # verify if an UUID was patched or if it is the first range
           verify = check and patched or range.begin == 0
           range_desc = [range, data, verify]
-
-          # this waits until all threads are waiting (done writing prev range or dead)
-          sleep 1 until threads.each(&:stop?).all?
-          # FAIL if no thread is alive
-          return false if threads.none? &:alive?
 
           burners.each do |burner|
             next unless b2t[burner].alive?
             burner.range_queue << range_desc
           end
+        end # each
+
+        {}.tap do |results|
+          b2t.map do |burner, t|
+            results[burner.filename] = t.value
+          end
         end
-      end # spinner
-    end # each
-    results = threads.map(&:value)
-  end # open
-  true
-end
 
-      end
-        
+      end # class Burner
 
-    end # class BurnerManager
+    end # class BurnManager
   end # module Image
 end # module StormFly
-
-
-def get_queued_range
-  r = Thread.current[:data]
-  [r[:range], r[:data], r[:verify]]
-end
-
-def burn_thread(target, output = STDOUT)
-  File.open target, 'wb' do |tgt|
-    tgt.advise :noreuse
-
-    File.open target, 'rb' do |tgtdirect|
-      tgtdirect.advise :random
-      tgtdirect.advise :noreuse
-      tgtdirect.advise :dontneed
-
-      loop do
-        range, data, verify = queue.pop
-        break false unless burn_range(tgt, range, data, verify ? tgtdirect : nil, output)
-      end
-    end
-  end
-end
