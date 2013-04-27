@@ -42,7 +42,7 @@ def with_options(*args)
     end
 
     opts.on '-t TARGETDEVICE', '--target', WritablePathname, 'Target device' do |targetfile|
-      options[:targetfile] = targetfile
+      options[:targetfile] = [targetfile]
     end
   end
 
@@ -81,7 +81,19 @@ Application.run do
       end
     end
 
-    # exit code 10 if burn fails verification (if enabled)
-    exit 10 unless burn opt[:imagefile], opt[:uuidfile], opt[:targetfile], opt.fetch(:check, false)
+    uuids = get_uuids opt[:uuidfile]
+    bm = StormFly::Image::BurnManager.new(opt[:imagefile], opt[:targetfile], :check => opt.fetch(:check, false), :uuids => uuids)
+    # exit code 11... if burn fails verification (if enabled)
+    retcode = bm.burn!.inject(0) do |acc, kv|
+      device, result = kv
+      if result
+        acc
+      else
+        STDERR.puts "#{device} failed to burn properly"
+        acc += 1
+      end
+    end
+    retcode += 10 if retcode > 0
+    exit retcode
   end
 end
